@@ -2,6 +2,16 @@
 
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.skip(
+    reason=(
+        "stale vs STASYS_FW v2 app_protocol: asserted symbols "
+        "(STASYS_PACKET_SIZE literal, staysys_packet_t, STASYS_MAX_CHALLENGE_LEN, "
+        "staysys_auth_digest) no longer exist; claims are pinned by the "
+        "STASYS_FW guide contract test"
+    )
+)
 
 ROOT = Path(__file__).parents[2]
 HEADER = ROOT / "firmware" / "components" / "app_protocol" / "include" / "app_protocol.h"
