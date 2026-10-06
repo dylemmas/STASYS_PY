@@ -4452,8 +4452,8 @@ class MainWindow(QMainWindow):
             # Feed live phase data to right-panel canvas
             if hasattr(self, 'live_phase_canvas') and self.live_phase_canvas is not None:
                 self.live_phase_canvas.feed_live_phase({
-                    'hold': (list(self.detector.trace_x[-100:]),
-                             list(self.detector.trace_y[-100:])),
+                    'hold': (list(self.detector.trace_x)[-100:],
+                             list(self.detector.trace_y)[-100:]),
                     'press': ([], []),
                     'recoil': ([], []),
                 })
