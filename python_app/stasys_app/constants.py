@@ -1,6 +1,11 @@
-"""Shared protocol, display, and detector constants."""
+"""Shared protocol, display, and detector constants.
 
-import os
+Protocol truth lives in ``tools/stasys_packet.py`` (the vendored reference
+implementation): frame layout, checksum, authentication version, nonce and
+proof rules are defined there, not here. This module only carries presentation,
+detector and timing constants that the UI consumes.
+"""
+
 import struct
 from dataclasses import dataclass
 
@@ -49,10 +54,6 @@ HOLD_DURATION_IDX = 300
 PRESS_DURATION_IDX = 20
 RECOIL_DURATION_IDX = 100
 SHOT_PHASE_TOTAL = HOLD_DURATION_IDX + PRESS_DURATION_IDX + RECOIL_DURATION_IDX
-AUTH_TIMEOUT = 12.0
-AUTH_RESPONSE_TIMEOUT = 3.0
-AUTH_CHALLENGE_LENGTH = 16
-SECRET_KEY = os.environ.get('STASYS_SECRET_KEY', '12ebaf10h12fa9123z21sti').encode()
 
 FEINWERKBAU_PROFILES = {
     'FWB_P700': {'id': 'FWB_P700', 'name': 'Feinwerkbau P700 Air Pistol', 'type': 'pistol', 'target_type': '10m_air_pistol', 'target_distance': 10.0, 'muzzle_velocity': 175.0, 'trigger_pull_time_ms': 45.0, 'max_energy_j': 7.5},

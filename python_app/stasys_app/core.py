@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-STASYS Receiver v3.4 - Auth Fix + Piezo Range Fix
-Fix summary (v3.3 → v3.4):
-  Problem 1 — Auth failing on reconnect
-              → flush buffer BEFORE ESP sends READY, then wait 1.5s
-              → added debug logging to see exactly what auth receives
-              → increased AUTH_TIMEOUT to 12s to match firmware 10s window
-  Problem 2 — Piezo always outside range
-              → raised PIEZO_MAX_LIMIT from 1000 to 4000
-              → raised DEFAULT_PIEZO_MIN from 50 to 100
-              → tune DEFAULT_PIEZO_MIN by watching Piezo: telemetry
+STASYS Receiver v4.0 - SPP v2 authentication and stream parsing
+
+Protocol truth lives in tools/stasys_packet.py (vendored reference):
+  - authentication is SPP v2 (READY v=2 + AUTH <64 hex> -> PROOF <64 hex>),
+    driven by spp.SppReceiver through perform_auth_v2();
+  - 36-byte binary frames are recovered from the byte stream by
+    spp.PacketParser via parse_binary_packet().
+
+Fix summary (v3.4 -> v4.0):
+  Problem 1 - auth failing on reconnect
+              -> legacy flush-buffer + 1.5s sleep handshake (perform_auth)
+                 replaced by perform_auth_v2(), which delegates the exact
+                 70-character PROOF write, line handling and comparison to
+                 spp.SppReceiver -- no reset_input_buffer, no fixed sleep
+  Problem 2 - coalesced OK\n + first frame being dropped
+              -> the handshake tail is drained into the caller's parser
+  Problem 3 - piezo always outside range
+              -> PIEZO_MAX_LIMIT raised to 4000, DEFAULT_PIEZO_MIN to 100
 """
 
 import sys
@@ -1148,73 +1156,88 @@ def parse_binary_packet(ser, parser=None):
 
 # ================= AUTHENTICATION =================
 
-def perform_auth(ser):
-    """
-    Auth fix v3.4:
-    - Flush the serial buffer FIRST (before ESP sends READY)
-    - Wait 1.5s so the ESP has time to broadcast its first READY
-    - Then listen for up to AUTH_TIMEOUT seconds
-    - The firmware now sends READY every 500ms, so we can't miss it
-    - Added debug logging so you can see exactly what arrives
+#: Guidance appended when the firmware refuses a proof (a `FAIL\n` line).
+_AUTH_REJECTED_HINT = (
+    "firmware rejected the key — a stock build has no provisioned key and "
+    "cannot authenticate (flash a keyed build); if this worked before the "
+    "generation is likely stale — reset it to 1 after a device reboot and "
+    "verify the identity is the device MAC"
+)
+
+#: Guidance appended when the port went silent mid-handshake (EOF).
+_AUTH_CLOSED_HINT = (
+    "connection closed during the handshake — another host connected, or the "
+    "authentication attempts ran out"
+)
+
+
+def _auth_failure_detail(error: Exception) -> str:
+    """Map an auth exception to a user-facing detail string (never raises)."""
+    text = str(error) or type(error).__name__
+    low = text.lower()
+    if "closed" in low or "timed out" in low:
+        return "%s (%s)" % (_AUTH_CLOSED_HINT, text)
+    if "rejected" in low:
+        return "%s (%s)" % (_AUTH_REJECTED_HINT, text)
+    # Anything else (bad banner, empty key, unsupported version) is reported
+    # verbatim: appending key guidance would misdiagnose a config error.
+    return text
+
+
+def perform_auth_v2(ser, *, banner=None, key, identity, generation,
+                    pending_parser=None):
+    """Run the SPP v2 handshake on an already-open serial port.
+
+    Returns ``(ok, detail)``. Never raises into the UI thread: every protocol
+    failure is reported as ``(False, detail)``.
+
+    ``banner`` is the raw banner bytes already consumed by discovery (the
+    ``READY v=2\nAUTH <hex>\n`` lines). When given it is prefilled into the
+    receiver's pending buffer so nothing is re-read from the stream; when
+    ``None`` the receiver reads the banner normally.
+
+    After a successful handshake the receiver's pending tail (bytes coalesced
+    behind the ``OK\n`` reply, typically the first binary frame) is drained
+    into ``pending_parser`` — the ``OK\n``+frame coalescing hazard.
+
+    No input-buffer flush and no fixed sleep: the handshake is line-driven.
     """
     if hasattr(ser, 'update_sim'):
-        return True
+        return True, "simulation"
 
-    logger.info("Handshaking — flushing buffer and waiting for READY...")
     try:
-        # Step 1: Flush any stale bytes from previous session
-        ser.reset_input_buffer()
+        receiver = spp.SppReceiver(
+            ser, key=key, identity=identity, generation=generation)
+        if banner:
+            receiver._pending.extend(bytes(banner))
+        receiver.authenticate()
+    except (spp.SppAuthenticationError, ValueError, OSError) as error:
+        # pyserial raises SerialException (an OSError) when the port is yanked
+        # mid-handshake; it must reach the caller as a tuple, not as a raise.
+        logger.error("[AUTH] v2 handshake failed: %s", error)
+        return False, _auth_failure_detail(error)
 
-        # Step 2: Wait for ESP to send its first READY broadcast
-        # Firmware waits 0ms then starts sending READY every 500ms,
-        # so 1.5s gives us 2-3 chances before we even start reading
-        time.sleep(1.5)
+    # Drain whatever followed the OK line into the caller's parser.
+    # The raw tail is appended to the parser's buffer rather than fed, so a
+    # frame already complete in the tail is NOT decoded and dropped here: it
+    # stays staged until the read loop's next feed() and is delivered there.
+    # PacketParser has no public "stage bytes" API and the (ok, detail)
+    # signature cannot carry packets back, so the buffer is the handoff.
+    if receiver._pending:
+        target = (pending_parser if pending_parser is not None
+                  else _default_packet_parser())
+        target._buffer.extend(receiver._pending)
+        # Enforce PacketParser's own cap here, not on the next feed(): feed()
+        # trims from the head first, which would otherwise eat a staged frame
+        # as soon as new bytes arrive.
+        if len(target._buffer) > target.max_buffer_size:
+            excess = len(target._buffer) - target.max_buffer_size
+            del target._buffer[:excess]
+            target.discarded_bytes += excess
+        receiver._pending.clear()
 
-        start = time.time()
-        while time.time() - start < AUTH_TIMEOUT:
-            if ser.in_waiting:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                logger.debug("[AUTH] RX: %r", line)   # shows every line received
-
-                if "READY" in line:
-                    logger.info("[AUTH] Got READY — sending challenge")
-                    challenge = ''.join(
-                        random.choices(string.ascii_letters + string.digits,
-                                       k=AUTH_CHALLENGE_LENGTH))
-                    ser.write(f"{challenge}\n".encode('utf-8'))
-                    logger.debug("[AUTH] Challenge sent: %s", challenge)
-
-                    st = time.time()
-                    while time.time() - st < AUTH_RESPONSE_TIMEOUT:
-                        if ser.in_waiting:
-                            resp = ser.readline().decode('utf-8', errors='ignore').strip()
-                            logger.debug("[AUTH] Response RX: %r", resp)
-
-                            # Skip if we accidentally read another READY
-                            if not resp or resp.upper() == "READY":
-                                continue
-
-                            expected = hashlib.sha256(
-                                (challenge + SECRET_KEY.decode('utf-8')).encode()
-                            ).hexdigest()
-
-                            if hmac.compare_digest(resp.lower(), expected.lower()):
-                                logger.info("[AUTH] Success!")
-                                return True
-
-                            logger.warning("[AUTH] Hash mismatch — got: %r", resp)
-                            logger.warning("[AUTH] Expected:           %r", expected)
-                        time.sleep(0.01)
-
-                    logger.warning("[AUTH] No valid response within %.1fs", AUTH_RESPONSE_TIMEOUT)
-
-            time.sleep(0.05)
-
-        logger.error("[AUTH] Timed out after %.1fs", AUTH_TIMEOUT)
-
-    except Exception:
-        logger.exception("Authentication error")
-    return False
+    logger.info("[AUTH] v2 handshake succeeded (generation=%s)", generation)
+    return True, "authenticated"
 
 
 # ================= DEVICE DISCOVERY =================

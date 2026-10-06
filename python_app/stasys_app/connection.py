@@ -5,10 +5,10 @@ from .core import (
     MockSerial,
     discover_stasys_devices,
     parse_binary_packet,
-    perform_auth,
+    perform_auth_v2,
 )
 
 __all__ = [
     "ConnectionScreen", "MockSerial", "discover_stasys_devices",
-    "parse_binary_packet", "perform_auth",
+    "parse_binary_packet", "perform_auth_v2",
 ]
