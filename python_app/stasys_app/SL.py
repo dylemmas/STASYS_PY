@@ -17,7 +17,7 @@ if __name__ == '__main__':
     conn = ConnectionScreen()
     if conn.exec_() != QDialog.Accepted:
         sys.exit(0)
-    win = MainWindow(conn.serial_port)
+    win = MainWindow(conn.serial_port, conn.parser)
     if conn.is_simulation:
         win.setWindowTitle(win.windowTitle() + " [SIMULATION]")
     win.show()
