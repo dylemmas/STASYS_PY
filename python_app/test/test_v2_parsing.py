@@ -158,3 +158,106 @@ def test_wrapper_returns_none_when_no_frame_completed():
 
     parser = spp.PacketParser()
     assert parse_binary_packet(FakeSerial(b'\xAA'), parser) is None
+
+
+def _core_module():
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    app_path = str(REPO_ROOT / 'python_app' / 'stasys_app')
+    if app_path not in sys.path:
+        sys.path.insert(0, app_path)
+    import core
+    return core
+
+
+def _row(*overrides):
+    """An 11-field row; overrides replace ax..gz left-to-right (first 6)."""
+    row = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1, 2, 3, 4, 5]
+    row[:len(overrides)] = overrides
+    return row
+
+
+def test_drop_nonfinite_keeps_rows_with_finite_ax_through_gz():
+    core = _core_module()
+    rows = [_row(), _row(0.0, -1.5, 1e30, -1e-30, 0.0, 99.0)]
+
+    assert core._drop_nonfinite(rows) == rows
+
+
+def test_drop_nonfinite_drops_row_when_any_of_first_six_fields_is_nonfinite():
+    core = _core_module()
+    for bad in (float('nan'), float('inf'), float('-inf')):
+        for index in range(6):
+            poisoned = _row()
+            poisoned[index] = bad
+            assert core._drop_nonfinite([poisoned, _row()]) == [_row()], (
+                "row with %s in field %d must be dropped" % (bad, index))
+
+
+def test_drop_nonfinite_ignores_nonfinite_values_after_gz():
+    core = _core_module()
+    row = _row()
+    row[6] = float('nan')   # mag_x
+    row[9] = float('inf')   # piezo
+
+    assert core._drop_nonfinite([row]) == [row]
+
+
+def test_drop_nonfinite_accepts_short_rows_without_ax_through_gz():
+    # Only rows carrying the 6 IMU fields can be judged; anything shorter is
+    # out of scope for the consumer filter and is passed through untouched.
+    core = _core_module()
+    short = [1, 2, 3]
+
+    assert core._drop_nonfinite([short]) == [short]
+
+
+def test_drop_nonfinite_returns_fresh_list_and_preserves_order():
+    core = _core_module()
+    rows = [_row(float('nan')), _row(), _row(float('inf')), _row()]
+    kept = core._drop_nonfinite(rows)
+
+    assert kept == [_row(), _row()]
+    assert kept is not rows
+    # Input untouched (element identity: NaN != NaN breaks list equality).
+    assert len(rows) == 4 and rows[1] is kept[0] and rows[3] is kept[1]
+
+
+def test_deque_live_phase_tail_payload_avoids_unsupported_slice():
+    from collections import deque
+
+    trace = deque(range(150), maxlen=500)
+    # Document the defect class: deque does not support slicing, so the
+    # live-phase 'hold' payload must convert to list before taking the tail.
+    with pytest.raises(TypeError, match="sequence index must be integer"):
+        trace[-100:]
+
+    payload_tail = list(trace)[-100:]
+    assert payload_tail == list(range(50, 150))
+
+
+def test_update_loop_live_phase_feed_survives_deque_traces():
+    """The live update_loop must not crash feeding the phase canvas.
+
+    Regression guard for core.py:4455 -- the 'hold' payload used to slice
+    detector.trace_x (a collections.deque) directly, raising TypeError on
+    the first non-calibrating packet and killing the stream.
+    """
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    app_path = str(REPO_ROOT / 'python_app' / 'stasys_app')
+    if app_path not in sys.path:
+        sys.path.insert(0, app_path)
+    from PyQt5.QtWidgets import QApplication
+    import core
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    assert app is not None
+    ser = core.MockSerial()
+    win = core.MainWindow(ser)
+    for _ in range(300):
+        # Force one sim frame per tick (bypass the 10 ms DT gate) so the
+        # empty-tick liveness counter stays at zero and the non-calibrating
+        # body (including the live-phase feed) is exercised repeatedly.
+        ser.last_update = 0.0
+        win.update_loop()
+    assert win._stream_empty_ticks == 0
+    assert win._stream_dead is False

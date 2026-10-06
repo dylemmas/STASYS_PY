@@ -141,6 +141,13 @@ MONITOR_TRACE_LENGTH = 100
 COOLDOWN_DURATION    = 0.5
 MAX_PACKETS_PER_TICK = 10
 
+# Stream liveness: >200 consecutive empty ticks (~2 s at the 10 ms timer)
+# means the device went away -> MainWindow._handle_stream_dead() runs ONCE.
+STREAM_DEAD_TICKS = 200
+
+# Rate limit for surplus-drop debug lines (never one line per frame/tick).
+DROP_LOG_INTERVAL = 5.0  # seconds between debug lines
+
 SCORE_PENALTY_TRAVEL = 1200.0
 SCORE_PENALTY_JERK   = 5000.0
 
@@ -1383,6 +1390,27 @@ def parse_binary_packet(ser, parser=None):
     except Exception:
         logger.exception("Error parsing binary packet")
     return None
+
+
+def _drop_nonfinite(rows):
+    """Consumer-side NaN/Inf filter for parse_binary_packet rows.
+
+    The SPP parser accepts non-finite payloads by contract (see
+    test_parser_accepts_nan_and_infinity_payloads), so the only place a
+    non-finite IMU value may be dropped is here, between the parser and the
+    detector. A row is dropped when any of its first 6 fields (ax, ay, az,
+    gx, gy, gz) is not ``math.isfinite``; fields after gz (mag, piezo,
+    battery) are integers and are never inspected. Rows shorter than 6
+    fields are passed through untouched (out of scope for this filter).
+
+    Returns a new list; ``rows`` is never mutated. Order is preserved.
+    """
+    kept = []
+    for row in rows:
+        if len(row) >= 6 and not all(math.isfinite(v) for v in row[:6]):
+            continue
+        kept.append(row)
+    return kept
 
 
 # ================= AUTHENTICATION =================
@@ -3137,9 +3165,20 @@ class LiveMonitorWindow(QMainWindow):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, serial_port):
+    def __init__(self, serial_port, parser=None):
         super().__init__()
         self.ser         = serial_port
+        # Persistent SPP parser: the auth tail coalesced behind the OK\n reply
+        # was drained into ConnectionScreen's parser, so the UI loop must keep
+        # feeding that SAME parser (SL.py passes conn.parser; parser=None falls
+        # back to a fresh one for direct construction).
+        self.parser      = parser or spp.PacketParser()
+        # Stream-health bookkeeping for update_loop / _handle_stream_dead.
+        self._stream_empty_ticks = 0   # consecutive ticks with no frame
+        self._stream_dead = False      # _handle_stream_dead ran already
+        self._nonfinite_dropped = 0    # rows removed by _drop_nonfinite
+        self._surplus_dropped = 0      # rows past MAX_PACKETS_PER_TICK
+        self._last_drop_log = 0.0      # monotonic ts of last surplus log
         self.detector    = ShotDetector()
         self.session_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.live_window = None
@@ -4546,17 +4585,80 @@ class MainWindow(QMainWindow):
         if score >= 60: return 'D'
         return 'F'
 
+    def _handle_stream_dead(self):
+        """Stream silence for >STREAM_DEAD_TICKS ticks (~2 s): stop the tick
+        timer, log parser health ONCE, and tell the user.
+
+        No auto-reconnect: reconnecting re-enters the auth handshake and the
+        device counts each connect, so the user must restart the app.
+        """
+        if self._stream_dead:
+            return
+        self._stream_dead = True
+        self.timer.stop()
+        # Logged once, never per frame / per tick.
+        logger.warning(
+            "Stream dead after %d consecutive empty ticks - parser stats: "
+            "discarded_bytes=%s checksum_errors=%s invalid_frames=%s "
+            "(nonfinite_dropped=%d surplus_dropped=%d)",
+            STREAM_DEAD_TICKS,
+            getattr(self.parser, 'discarded_bytes', 'n/a'),
+            getattr(self.parser, 'checksum_errors', 'n/a'),
+            getattr(self.parser, 'invalid_frames', 'n/a'),
+            self._nonfinite_dropped, self._surplus_dropped)
+        if hasattr(self, 'lbl_status'):
+            self.lbl_status.setText(
+                "CONNECTION LOST — restart the app to reconnect "
+                "(device counts each connect)")
+            self.lbl_status.setStyleSheet(
+                f"color: {COLORS['accent_bad']}; font-size: 11px; "
+                f"font-weight: 600; padding: 6px 10px; "
+                f"background: {COLORS['bg_tertiary']}; border-radius: 6px; "
+                f"border: 1px solid {COLORS['accent_bad']};")
+
     def update_loop(self):
         if hasattr(self.ser, 'update_sim'):
             self.ser.update_sim()
 
-        count = 0
-        while self.ser.in_waiting >= PACKET_SIZE and count < MAX_PACKETS_PER_TICK:
-            count += 1
-            pkt = parse_binary_packet(self.ser)
-            if not pkt:
-                continue
+        # One bounded read per tick (never more than MAX_TICK_BYTES), parsed by
+        # the persistent parser shared with the auth handshake. All bytes are
+        # consumed every tick; only MAX_PACKETS_PER_TICK rows reach the
+        # UI-heavy body below.
+        pkts = parse_binary_packet(self.ser, self.parser)
+        if not pkts:
+            # Miss-counter path: no frame completed this tick.
+            self._stream_empty_ticks += 1
+            if (self._stream_empty_ticks > STREAM_DEAD_TICKS
+                    and not self._stream_dead):
+                self._handle_stream_dead()
+            return
 
+        self._stream_empty_ticks = 0
+        rows = _drop_nonfinite(pkts)
+        if len(rows) < len(pkts):
+            self._nonfinite_dropped += len(pkts) - len(rows)
+
+        # TRIP-WIRE (spp-parsing-guide): if _nonfinite_dropped /
+        # _surplus_dropped keep growing while parser.checksum_errors stays
+        # flat, the TICK is the bottleneck (UI budget), not the wire - only
+        # then introduce a reader thread feeding DropOldestQueue(256)
+        # (queue.Queue(maxsize=256) that discards the oldest item on full).
+        # YAGNI for now: the 10 ms timer ~= frame period, 3.6 KB/s fits the
+        # OS serial buffer, PacketParser self-bounds at 144 B, and reader ==
+        # consumer on one thread.
+        if len(rows) > MAX_PACKETS_PER_TICK:
+            surplus = len(rows) - MAX_PACKETS_PER_TICK
+            self._surplus_dropped += surplus
+            now = time.monotonic()
+            if now - self._last_drop_log >= DROP_LOG_INTERVAL:
+                self._last_drop_log = now
+                logger.debug(
+                    "tick dropped %d surplus rows (total surplus=%d, "
+                    "nonfinite=%d)",
+                    surplus, self._surplus_dropped, self._nonfinite_dropped)
+            rows = rows[:MAX_PACKETS_PER_TICK]
+
+        for pkt in rows:
             if self.calibrating:
                 self.calib_buffer.append(pkt)
                 if len(self.calib_buffer) >= CALIBRATION_SAMPLE_COUNT:
@@ -4601,8 +4703,8 @@ class MainWindow(QMainWindow):
             # Feed live phase data to right-panel canvas
             if hasattr(self, 'live_phase_canvas') and self.live_phase_canvas is not None:
                 self.live_phase_canvas.feed_live_phase({
-                    'hold': (list(self.detector.trace_x[-100:]),
-                             list(self.detector.trace_y[-100:])),
+                    'hold': (list(self.detector.trace_x)[-100:],
+                             list(self.detector.trace_y)[-100:]),
                     'press': ([], []),
                     'recoil': ([], []),
                 })
