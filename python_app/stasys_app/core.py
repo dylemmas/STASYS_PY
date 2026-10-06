@@ -3267,6 +3267,44 @@ class MainWindow(QMainWindow):
         self._build_live_monitor_tab()
         self._build_settings_tab()
 
+        # ---- SCATT layout opt-in (env STASYS_LAYOUT=scatt) ----------------
+        # Reproduces SCATT Basic's chrome AROUND the existing tab content:
+        # TitleBar (mode/session/status) above, StatusBar footer below, tabs
+        # kept as the mode switch for this pass (docs/scatt_ui_spec.md 8.4-A).
+        # Additive only: with the env var unset the legacy layout above is
+        # untouched. Layout provenance is static SCATT extraction only.
+        if os.environ.get('STASYS_LAYOUT', '').strip().lower() == 'scatt':
+            try:
+                from .scatt_layout import StatusBar, TitleBar
+
+                shell = QWidget()
+                shell_l = QVBoxLayout(shell)
+                shell_l.setContentsMargins(14, 12, 14, 10)
+                shell_l.setSpacing(10)
+                self.scatt_title_bar = TitleBar(
+                    mode='Practice', session_title='Session')
+                shell_l.addWidget(self.scatt_title_bar)
+                shell_l.addWidget(self.tabs, 1)
+                self.scatt_status_bar = StatusBar('Ready')
+                shell_l.addWidget(self.scatt_status_bar)
+
+                # Title-bar Settings button jumps to the Settings tab.
+                def _goto_settings():
+                    for i in range(self.tabs.count()):
+                        if self.tabs.tabText(i) == 'Settings':
+                            self.tabs.setCurrentIndex(i)
+                            return
+                self.scatt_title_bar.settingsRequested.connect(_goto_settings)
+
+                # The legacy header frame is superseded by the TitleBar.
+                first = self.centralWidget().layout().itemAt(0).widget()
+                if first is not None:
+                    first.setVisible(False)
+                self.setCentralWidget(shell)
+            except Exception:
+                logger.exception(
+                    'SCATT layout unavailable; keeping legacy layout')
+
     def _build_shot_detection_tab(self):
         """Build the analysis-first landing tab."""
         tab = QWidget()
