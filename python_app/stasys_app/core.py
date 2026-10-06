@@ -980,6 +980,209 @@ def load_settings():
         return {}
 
 
+# ================= SPP v2 CONFIG + GENERATION TRACKER =================
+#
+# Client-side configuration for the v2 handshake (protocol truth: tools/README.md).
+# Precedence is env > settings.json > default for every field; the key and the
+# identity have NO default and fail closed (return None) when absent or malformed,
+# because a fabricated credential would only ever produce a well-formed proof that
+# the device rejects with an indistinguishable FAIL.
+#
+# The generation seed is the one value with a safe default: after a device reboot
+# it is 1, and there is no UI field to reset it (UX constraint), so the documented
+# override for a rebooted device is STASYS_GENERATION=1.
+
+#: Environment variables (primary source). The key is raw UTF-8 bytes, matching
+#: the CLI's --key-env contract in tools/stasys_packet.py.
+_SPP_KEY_ENV = 'STASYS_DEVICE_KEY'
+_SPP_IDENTITY_ENV = 'STASYS_DEVICE_IDENTITY'
+_SPP_GENERATION_ENV = 'STASYS_GENERATION'
+
+#: settings.json keys (fallback source), load-merge-saved like every other writer.
+_SPP_SETTINGS_KEY = 'spp_key_hex'
+_SPP_SETTINGS_IDENTITY = 'spp_identity_hex'
+_SPP_SETTINGS_GENERATION = 'spp_next_generation'
+
+#: Seed used when nothing is configured and no override is set (fresh device).
+_SPP_DEFAULT_GENERATION = 1
+#: The Bluetooth address the firmware binds to is 6 bytes / 12 hex digits.
+_SPP_IDENTITY_BYTES = 6
+_SPP_GENERATION_MAX = 0xFFFFFFFF
+
+
+def _spp_setting(settings, name):
+    """Read one settings.json field; empty strings count as absent."""
+    if not isinstance(settings, dict):
+        return None
+    value = settings.get(name)
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
+
+
+def _spp_uint32(value):
+    """Coerce a seed to 1..0xFFFFFFFF, or None when unusable (0 included)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value.strip(), 10)
+        except ValueError:
+            return None
+    if not isinstance(value, int):
+        return None
+    if not _SPP_DEFAULT_GENERATION <= value <= _SPP_GENERATION_MAX:
+        return None
+    return value
+
+
+def _load_spp_key(settings):
+    """Env STASYS_DEVICE_KEY (raw UTF-8) > settings spp_key_hex > None.
+
+    A present-but-empty env override is a config error, not "unset": it fails
+    closed instead of silently falling back to a different credential.
+    """
+    if _SPP_KEY_ENV in os.environ:
+        raw = os.environ[_SPP_KEY_ENV]
+        # Blank means the variable was exported without a value: a config error,
+        # not "unset" -- never fall through to a different credential.
+        if not raw.strip():
+            return None
+        return raw.encode('utf-8')
+    text = _spp_setting(settings, _SPP_SETTINGS_KEY)
+    if not isinstance(text, str):
+        return None
+    try:
+        key = bytes.fromhex(text)
+    except ValueError:
+        logger.error("[SPP] '%s' is not valid hex — the device key is unusable",
+                     _SPP_SETTINGS_KEY)
+        return None
+    return key or None
+
+
+def _load_spp_identity(settings):
+    """Env STASYS_DEVICE_IDENTITY > settings spp_identity_hex > None.
+
+    Accepts the bare form (``010203040506``) and the colon-separated MAC form
+    (``01:02:03:04:05:06``); anything that does not decode to exactly 6 bytes
+    fails closed.
+    """
+    if _SPP_IDENTITY_ENV in os.environ:
+        raw = os.environ[_SPP_IDENTITY_ENV].strip()
+        if not raw:
+            return None
+    else:
+        raw = _spp_setting(settings, _SPP_SETTINGS_IDENTITY)
+        if not isinstance(raw, str):
+            return None
+    text = raw.replace(':', '')
+    try:
+        identity = bytes.fromhex(text)
+    except ValueError:
+        logger.error("[SPP] '%s' is not a hex Bluetooth address",
+                     _SPP_IDENTITY_ENV if _SPP_IDENTITY_ENV in os.environ
+                     else _SPP_SETTINGS_IDENTITY)
+        return None
+    if len(identity) != _SPP_IDENTITY_BYTES:
+        logger.error("[SPP] identity must be %d bytes, got %d",
+                     _SPP_IDENTITY_BYTES, len(identity))
+        return None
+    return identity
+
+
+def _load_spp_generation(settings):
+    """Env STASYS_GENERATION (one-shot override) > spp_next_generation > 1."""
+    if _SPP_GENERATION_ENV in os.environ:
+        seed = _spp_uint32(os.environ[_SPP_GENERATION_ENV])
+        if seed is not None:
+            return seed
+        logger.warning("[SPP] invalid %s=%r — falling back to '%s'",
+                       _SPP_GENERATION_ENV, os.environ[_SPP_GENERATION_ENV],
+                       _SPP_SETTINGS_GENERATION)
+    seed = _spp_uint32(_spp_setting(settings, _SPP_SETTINGS_GENERATION))
+    if seed is not None:
+        return seed
+    return _SPP_DEFAULT_GENERATION
+
+
+def _load_spp_config():
+    """Resolve the SPP v2 credentials and the generation seed for this connection.
+
+    Returns ``(key, identity, generation)`` — ``(bytes, bytes, int)`` — or
+    ``None`` when the device is not configured (missing or malformed key or
+    identity). Callers must treat ``None`` as "device not configured": close the
+    port and report the missing-field message, never open the handshake with a
+    placeholder credential.
+
+    ``generation`` is the seed to authenticate WITH for this connection; it is
+    only ever persisted afterwards by :func:`advance_generation`, and only after
+    the handshake succeeded.
+    """
+    settings = load_settings()
+
+    key = _load_spp_key(settings)
+    if key is None:
+        logger.warning("[SPP] no device key configured — set %s or '%s'",
+                       _SPP_KEY_ENV, _SPP_SETTINGS_KEY)
+        return None
+
+    identity = _load_spp_identity(settings)
+    if identity is None:
+        logger.warning("[SPP] no device identity configured — set %s or '%s'",
+                       _SPP_IDENTITY_ENV, _SPP_SETTINGS_IDENTITY)
+        return None
+
+    if not any(identity):
+        logger.warning("[SPP] device identity is all zeroes — the device MAC "
+                       "looks unset; authenticating anyway")
+
+    return key, identity, _load_spp_generation(settings)
+
+
+def advance_generation(generation):
+    """Persist ``generation + 1`` as the seed for the next connection.
+
+    Load-merge-save against settings.json, matching every other settings
+    writer: existing keys are preserved. Call it ONLY after a successful
+    handshake — the firmware increments its own counter on each accepted
+    connection open, so advancing on a failure would push the client seed one
+    step ahead of the device and make every later attempt a well-formed proof
+    that is rejected with ``FAIL``.
+
+    Wraparound matches the firmware: past ``0xFFFFFFFF`` the seed returns to 1
+    (the device skips 0).
+
+    Returns the persisted seed, or ``None`` when ``generation`` is not a valid
+    uint32 start value (nothing is written in that case).
+    """
+    valid = (
+        isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and _SPP_DEFAULT_GENERATION <= generation <= _SPP_GENERATION_MAX
+    )
+    if not valid:
+        logger.error("[SPP] refusing to advance generation from invalid value %r",
+                     generation)
+        return None
+
+    next_generation = generation + 1
+    if next_generation > _SPP_GENERATION_MAX:
+        next_generation = _SPP_DEFAULT_GENERATION
+
+    settings = load_settings()
+    if not isinstance(settings, dict):
+        # A corrupt settings.json must not stop the tracker: start fresh
+        # rather than raise into the UI thread.
+        logger.warning("[SPP] settings file is not a JSON object -- rewriting it")
+        settings = {}
+    settings[_SPP_SETTINGS_GENERATION] = next_generation
+    save_settings(settings)
+    logger.info("[SPP] generation advanced to %d", next_generation)
+    return next_generation
+
+
 # ================= CONNECTION SCREEN =================
 
 class ConnectionScreen(QDialog):
