@@ -177,12 +177,20 @@ def test_identity_from_settings_colon_form(core, tmp_settings):
 
 
 def test_identity_wrong_length_fails_closed(core, tmp_settings, monkeypatch):
+    """Reachability pin: with a valid key + identity in the SAME environment
+    the config loads, so the key gate (core.py:1126) is open and the None
+    below is caused by the malformed override alone."""
+    _write_settings(tmp_settings, {'spp_key_hex': GOOD_KEY_HEX,
+                                   'spp_identity_hex': GOOD_IDENTITY_HEX})
+    assert core._load_spp_config() is not None
+
     monkeypatch.setenv('STASYS_DEVICE_IDENTITY', '01020304050607')
 
     assert core._load_spp_config() is None
 
 
 def test_identity_non_hex_fails_closed(core, tmp_settings, monkeypatch):
+    _write_settings(tmp_settings, {'spp_key_hex': GOOD_KEY_HEX})
     monkeypatch.setenv('STASYS_DEVICE_IDENTITY', 'zz0203040506')
 
     assert core._load_spp_config() is None
