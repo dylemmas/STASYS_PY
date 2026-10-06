@@ -29,6 +29,16 @@ import sqlite3
 import json
 from datetime import datetime
 
+# --- vendored SPP protocol package (STASYS_PY/tools, at the REPO root) ---
+# The tools/ package lives next to python_app/, NOT inside it, so walk two
+# directories up from this file (.../STASYS_PY/python_app/stasys_app/core.py
+# -> .../STASYS_PY) before importing it.
+_core_dir = os.path.dirname(os.path.abspath(__file__))      # .../python_app/stasys_app
+_repo_root = os.path.dirname(os.path.dirname(_core_dir))    # .../STASYS_PY
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+from tools import stasys_packet as spp
+
 import numpy as np
 import serial
 import serial.tools.list_ports
@@ -67,6 +77,10 @@ PACKET_HEADER       = b'\xAA\xBB'
 PACKET_FORMAT       = '<ffffffhhhHB'  # ax,ay,az, gx,gy,gz, mag_x,mag_y,mag_z, piezo, bat = 33 bytes payload
 PACKET_PAYLOAD_SIZE = struct.calcsize(PACKET_FORMAT)   # 33 bytes
 DT                  = 0.01             # 10 ms  (100 Hz firmware)
+
+# Stream read cap: parse_binary_packet never pulls more than this many bytes
+# from the serial port in one tick, so it never blocks.
+MAX_TICK_BYTES      = 4096
 
 # QMC5883P sensitivity at ±30 Gauss full-scale: ~655 LSB / Gauss
 MAG_GAIN_LSB_PER_GA = 655.0
@@ -1096,27 +1110,37 @@ class ConnectionScreen(QDialog):
     def _on_continue(self):
         self.accept()
 
-def parse_binary_packet(ser):
+def _default_packet_parser():
+    """Lazily created module-level PacketParser, for single-arg callers."""
+    global _PACKET_PARSER
+    if _PACKET_PARSER is None:
+        _PACKET_PARSER = spp.PacketParser()
+    return _PACKET_PARSER
+
+
+_PACKET_PARSER = None
+_PACKET_FIELDS = (
+    'ax', 'ay', 'az', 'gx', 'gy', 'gz',
+    'mag_x', 'mag_y', 'mag_z', 'piezo', 'battery',
+)
+
+
+def parse_binary_packet(ser, parser=None):
+    """Drain up to MAX_TICK_BYTES of serial input through a PacketParser.
+
+    Returns a list of rows -- one per frame completed by this read, each row
+    holding the 11 Packet fields in order (ax, ay, az, gx, gy, gz, mag_x,
+    mag_y, mag_z, piezo, battery) -- or None when nothing completed. NaN/Inf
+    payloads pass through untouched; filtering belongs to the consumer.
+    """
     try:
-        while ser.in_waiting >= PACKET_SIZE:
-            b1 = ser.read(1)
-            if b1 != PACKET_HEADER[0:1]:
-                continue
-            b2 = ser.read(1)
-            if b2 != PACKET_HEADER[1:2]:
-                continue
-            raw_payload = ser.read(PACKET_PAYLOAD_SIZE + 1)
-            if len(raw_payload) != PACKET_PAYLOAD_SIZE + 1:
-                return None
-            received_checksum = raw_payload[-1]
-            data = raw_payload[:-1]
-            calc_sum = 0
-            for b in data:
-                calc_sum ^= b
-            if calc_sum != received_checksum:
-                logger.warning("Checksum mismatch, re-syncing stream")
-                continue
-            return list(struct.unpack(PACKET_FORMAT, data))
+        n = min(getattr(ser, 'in_waiting', 0), MAX_TICK_BYTES)
+        if n <= 0:
+            return None
+        packets = (parser or _default_packet_parser()).feed(ser.read(n))
+        return [
+            [getattr(p, name) for name in _PACKET_FIELDS] for p in packets
+        ] or None
     except Exception:
         logger.exception("Error parsing binary packet")
     return None
