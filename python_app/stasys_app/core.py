@@ -25,9 +25,6 @@ import os
 import time
 import math
 import random
-import hashlib
-import hmac
-import string
 import struct
 import logging
 from collections import deque
@@ -75,9 +72,8 @@ logger = logging.getLogger(__name__)
 BLUETOOTH_COM_PORT = 'COM4'
 BAUD_RATE = 115200
 
-SECRET_KEY = os.environ.get(
-    'STASYS_SECRET_KEY', '12ebaf10h12fa9123z21sti'
-).encode('utf-8')
+# Banner-only discovery (SPP v2): how long to wait for the two-line banner.
+BANNER_TIMEOUT_S = 2.0
 
 # Timing & Protocol
 PACKET_SIZE         = 36
@@ -222,13 +218,6 @@ def get_feinwerkbau_profile(profile_id: str) -> dict:
 # ── Firearm / Training Mode ────────────────────────────────────────────────────
 DEFAULT_FIREARM       = 'Pistol'
 DEFAULT_TRAINING_MODE = 'Dry Fire'
-
-# --- AUTH TIMING FIX ---
-# Increased to 12s to match the firmware's 10s READY broadcast window
-# Python needs the extra 2s margin for serial open + buffer flush
-AUTH_TIMEOUT          = 12.0          # was 5.0
-AUTH_RESPONSE_TIMEOUT = 3.0           # was 2.0
-AUTH_CHALLENGE_LENGTH = 16
 
 PLOT_RANGE  = 0.05
 RING_RADII  = [0.01, 0.02, 0.03]
@@ -1204,6 +1193,7 @@ class ConnectionScreen(QDialog):
 
         self.serial_port = None
         self.is_simulation = False
+        self.parser = spp.PacketParser()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(40, 32, 40, 32)
@@ -1286,12 +1276,38 @@ class ConnectionScreen(QDialog):
             logger.exception("Discovery failed: %s", exc)
             discovered = []
 
-        if discovered:
-            ser, desc = discovered[0]
+        if not discovered:
+            self._show_fallback()
+            return
+
+        ser, desc, banner = discovered[0]
+        cfg = _load_spp_config()
+        if cfg is None:
+            try:
+                ser.close()
+            except Exception:
+                logger.exception("Failed to close unconfigured device port")
+            self._show_auth_failure(
+                "Set STASYS_DEVICE_KEY (or spp_key_hex in settings.json) and "
+                "STASYS_DEVICE_IDENTITY. Continuing in simulation."
+            )
+            return
+
+        ok, detail = perform_auth_v2(
+            ser, banner=banner, key=cfg[0], identity=cfg[1],
+            generation=cfg[2], pending_parser=self.parser,
+        )
+        if ok:
+            advance_generation(cfg[2])
             self.serial_port = ser
             self._show_success(ser.port, desc or ser.port)
-        else:
-            self._show_fallback()
+            return
+
+        try:
+            ser.close()
+        except Exception:
+            logger.exception("Failed to close port after authentication failure")
+        self._show_auth_failure(detail)
 
     def _show_success(self, port: str, description: str):
         self._anim_timer.stop()
@@ -1315,6 +1331,18 @@ class ConnectionScreen(QDialog):
             "Continuing in simulation mode. Connect a STASYS sensor "
             "and restart to enable hardware."
         )
+        self.btn_continue.setVisible(True)
+        self.btn_continue.setText("Continue in Simulation")
+
+    def _show_auth_failure(self, detail: str):
+        self._anim_timer.stop()
+        self.serial_port = MockSerial()
+        self.is_simulation = True
+        self.status_icon.setText("!")
+        self.status_icon.setStyleSheet(f"color: {COLORS['accent_ok']};")
+        self.status_label.setText("Device found — authentication failed")
+        self.status_label.setStyleSheet(f"color: {COLORS['accent_ok']};")
+        self.detail_label.setText(detail)
         self.btn_continue.setVisible(True)
         self.btn_continue.setText("Continue in Simulation")
 
@@ -1445,67 +1473,49 @@ def perform_auth_v2(ser, *, banner=None, key, identity, generation,
 
 # ================= DEVICE DISCOVERY =================
 
-def discover_stasys_devices() -> List[Tuple[serial.Serial, str]]:
-    """Scan all COM ports and return those that complete the STASYS handshake.
+def discover_stasys_devices() -> list[tuple[serial.Serial, str, bytes]]:
+    """Discover a device from its SPP v2 banner without probing it.
 
-    For each port: opens it, waits for READY, then performs the full auth handshake.
-    Returns a live serial.Serial object on success (NOT closed).
-
-    Returns:
-        List of (serial.Serial, description) tuples. First match wins.
+    Every candidate is opened read-only for discovery. The first two complete
+    lines must be ``READY v=2`` and ``AUTH `` followed by 64 lowercase hex
+    characters. The winning port remains open and its exact raw banner is
+    returned for :func:`perform_auth_v2` to prefill its receiver.
     """
-    found: List[Tuple[serial.Serial, str]] = []
+    found: list[tuple[serial.Serial, str, bytes]] = []
     candidates = [p.device for p in serial.tools.list_ports.comports()]
     for port in sorted(candidates):
         probe_ser = None
         try:
-            probe_ser = serial.Serial(port, BAUD_RATE, timeout=1.0)
-            probe_ser.reset_input_buffer()
-            time.sleep(1.5)  # wait for firmware READY broadcast
+            probe_ser = serial.Serial(port, BAUD_RATE, timeout=0.5)
+            raw = bytearray()
+            deadline = time.monotonic() + BANNER_TIMEOUT_S
+            newline = b"\n"
+            while time.monotonic() < deadline and raw.count(newline) < 2:
+                chunk = probe_ser.read(256)
+                if chunk:
+                    raw.extend(chunk)
 
-            ready_found = False
-            deadline = time.time() + 2.0
-            while time.time() < deadline:
-                if probe_ser.in_waiting:
-                    line = probe_ser.readline().decode('utf-8', errors='ignore').strip()
-                    if "READY" in line:
-                        ready_found = True
-                        break
-                time.sleep(0.05)
-
-            if not ready_found:
-                continue
-
-            # Full auth handshake: send challenge, verify response
-            challenge = ''.join(
-                random.choices(string.ascii_letters + string.digits,
-                               k=AUTH_CHALLENGE_LENGTH))
-            probe_ser.write(f"{challenge}\n".encode('utf-8'))
-
-            resp_found = False
-            auth_deadline = time.time() + AUTH_RESPONSE_TIMEOUT
-            while time.time() < auth_deadline:
-                if probe_ser.in_waiting:
-                    resp = probe_ser.readline().decode('utf-8', errors='ignore').strip()
-                    if not resp:
-                        continue
-                    expected = hashlib.sha256(
-                        (challenge + SECRET_KEY.decode('utf-8')).encode()
-                    ).hexdigest()
-                    if hmac.compare_digest(resp.lower(), expected.lower()):
-                        desc = getattr(probe_ser, 'description', '') or ''
-                        found.append((probe_ser, desc or port))
-                        logger.info("Found STASYS device on %s (%s)", port, desc or port)
-                        return found  # return alive connection immediately
-                    logger.warning("[AUTH] Hash mismatch — got: %r", resp)
-                time.sleep(0.01)
-
+            banner = bytes(raw)
+            lines = banner.split(newline)
+            if (
+                len(lines) >= 3
+                and lines[0] == b"READY v=2"
+                and len(lines[1]) == 69
+                and lines[1].startswith(b"AUTH ")
+                and all(c in b"0123456789abcdef" for c in lines[1][5:])
+            ):
+                desc = getattr(probe_ser, "description", "") or port
+                found.append((probe_ser, desc, banner))
+                logger.info("Found STASYS v2 device on %s (%s)", port, desc)
+                return found
         except OSError:
             continue
         except Exception:
             continue
         finally:
-            if probe_ser and probe_ser.is_open and probe_ser not in [f[0] for f in found]:
+            if probe_ser is not None and probe_ser.is_open and probe_ser not in [
+                item[0] for item in found
+            ]:
                 probe_ser.close()
     return found
 
