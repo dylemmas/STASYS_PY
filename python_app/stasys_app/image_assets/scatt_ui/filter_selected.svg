@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <!-- Generator: Sketch 50.2 (55047) - http://www.bohemiancoding.com/sketch -->
+    <title>Icons/General/Filter Selected</title>
+    <desc>Created with Sketch.</desc>
+    <defs></defs>
+    <g id="Icons/General/Filter-Selected" stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+        <path d="M20.1502567,2 L3.85425668,2 C3.11825668,2 2.72825668,2.869 3.21725668,3.419 L10.0052567,11 L10.0072567,19.422 C10.0072567,19.688 10.1322567,19.939 10.3452567,20.099 L12.6532567,21.829 C12.8092567,21.947 12.9852567,22 13.1572567,22 C13.5952567,22 14.0072567,21.653 14.0072567,21.152 L14.0052567,11 L20.7852567,3.415 C21.2732567,2.867 20.8832567,2 20.1502567,2 Z M19.9292567,3 L13.3142567,10.336 L13.0052567,10.62 L13.0052567,11 L13.0072567,20.845 L11.0072567,19.345 L11.0052567,11 L11.0052567,10.62 L10.7522567,10.336 L4.18225668,3 L19.9292567,3 Z" id="Fill-1" fill="#00D26A"></path>
+    </g>
+</svg>

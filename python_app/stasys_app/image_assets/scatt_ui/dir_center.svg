@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="18px" height="18px" viewBox="0 0 18 18" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <!-- Generator: Sketch 55.1 (78136) - https://sketchapp.com -->
+    <title>Icons/Shotlist Table Icons/Direction/Center Copy</title>
+    <desc>Created with Sketch.</desc>
+    <g id="Icons/Shotlist-Table-Icons/Direction/Center-Copy" stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+        <polygon id="Boarder" points="0 18 18 18 18 0 0 0"></polygon>
+        <path d="M14.6664348,14.6665507 L12,14.6665507 L12,16 L14.6664348,16 C15.3996522,16 16,15.3997044 16,14.6665507 L16,12 L14.6664348,12 L14.6664348,14.6665507 Z M14.6664348,2 L12,2 L12,3.33356522 L14.6664348,3.33356522 L14.6664348,6 L16,6 L16,3.33356522 C16,2.6 15.3996522,2 14.6664348,2 L14.6664348,2 Z M3.33356522,3.33356522 L6,3.33356522 L6,2 L3.33356522,2 C2.60034783,2 2,2.6 2,3.33356522 L2,6 L3.33356522,6 L3.33356522,3.33356522 Z M3.33356522,12 L2,12 L2,14.6665507 C2,15.3997044 2.60034783,16 3.33356522,16 L6,16 L6,14.6665507 L3.33356522,14.6665507 L3.33356522,12 Z M9.00006522,8 C8.44766191,8 8,8.44753147 8,9.00006522 C8,9.55246853 8.44766191,10 9.00006522,10 C9.55246853,10 10,9.55246853 10,9.00006522 C10,8.44753147 9.55246853,8 9.00006522,8 L9.00006522,8 Z" id="Fill-1" fill="#0D0D0D"></path>
+    </g>
+</svg>

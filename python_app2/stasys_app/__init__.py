@@ -1,1 +1,0 @@
-"""STASYS receiver package."""

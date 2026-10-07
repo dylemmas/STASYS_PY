@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <!-- Generator: Sketch 50.2 (55047) - http://www.bohemiancoding.com/sketch -->
+    <title>Icons/General/View</title>
+    <desc>Created with Sketch.</desc>
+    <defs></defs>
+    <g id="Icons/General/View" stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+        <rect id="Boarder" x="0" y="0" width="24" height="24"></rect>
+        <path d="M12,9 C10.3431458,9 9,10.3431458 9,12 C9,13.6568542 10.3431458,15 12,15 C13.6568542,15 15,13.6568542 15,12 C15,10.3431458 13.6568542,9 12,9 Z M12,14 C10.8954305,14 10,13.1045695 10,12 C10,10.8954305 10.8954305,10 12,10 C13.1045695,10 14,10.8954305 14,12 C14,13.1045695 13.1045695,14 12,14 Z" id="Shape" fill="#00D26A" fill-rule="nonzero"></path>
+        <path d="M12,6 C7.78967075,5.90855672 3.90064617,8.24197147 2,12 C3.90064617,15.7580285 7.78967075,18.0914433 12,18 C16.2103293,18.0914433 20.0993538,15.7580285 22,12 C20.0993538,8.24197147 16.2103293,5.90855672 12,6 Z M12,17 C8.34524591,17.0741169 4.93790243,15.159879 3.1,12 C4.93790243,8.84012098 8.34524591,6.92588307 12,7 C15.6547541,6.92588307 19.0620976,8.84012098 20.9,12 C19.0620976,15.159879 15.6547541,17.0741169 12,17 Z" id="Shape" fill="#00D26A" fill-rule="nonzero"></path>
+    </g>
+</svg>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <!-- Generator: Sketch 55.1 (78136) - https://sketchapp.com -->
+    <title>cons/Shotlist Table Icons/Z+ Copy</title>
+    <desc>Created with Sketch.</desc>
+    <g id="cons/Shotlist-Table-Icons/Z+-Copy" stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+        <g id="Z+">
+            <rect id="Rectangle" fill-rule="nonzero" x="0" y="0" width="24" height="24"></rect>
+            <path d="M15.9582,7.36719 L15.9582,7.83519 C15.9582,7.97819 15.9148,8.11685 15.8282,8.25119 L10.5502,15.6547 L15.8802,15.6547 L15.8802,16.6817 L8.89917,16.6817 L8.89917,16.1877 C8.89917,16.1184 8.91,16.0534 8.93167,15.9927 C8.95767,15.932 8.988,15.8735 9.02267,15.8172 L14.3007,8.39419 L9.14617,8.39419 L9.14617,7.36719 L15.9582,7.36719 Z" id="Path" fill="#0D0D0D"></path>
+            <path d="M21.2063,8.09563 C21.7251,9.31904 22,10.6453 22,12 C22,17.5228 17.5228,22 12,22 C6.47715,22 2,17.5228 2,12 C2,6.47715 6.47715,2 12,2 C12.8702,2 13.7287,2.11342 14.5557,2.33208 C14.3947,2.62437 14.2653,2.93648 14.172,3.26382 C13.4764,3.09146 12.7489,3 12,3 C7.02948,3 3.00004,7.02944 3.00004,12 C3.00004,16.9706 7.02948,21 12,21 C16.9706,21 21,16.9706 21,12 C21,10.8001 20.7652,9.65506 20.3391,8.6083 C20.6482,8.4697 20.9388,8.29724 21.2063,8.09563 Z" id="Path" fill="#0D0D0D"></path>
+            <polygon id="Path" fill="#0D0D0D" points="19 2 18 2 18 4 16 4 16 5 18 5 18 7 19 7 19 5 21 5 21 4 19 4"></polygon>
+        </g>
+    </g>
+</svg>

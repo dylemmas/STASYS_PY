@@ -27,6 +27,8 @@ import math
 import random
 import struct
 import logging
+import re
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -55,7 +57,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QDoubleSpinBox, QGridLayout, QFrame,
     QProgressBar, QTabWidget, QSplitter, QSlider,
     QScrollArea, QSizePolicy, QDialog, QRadioButton)
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import (
     QColor, QPainter, QPen, QRadialGradient,
     QPainterPath, QFont, QBrush, QPalette)
@@ -69,11 +71,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ================= CONFIGURATION =================
-BLUETOOTH_COM_PORT = 'COM4'
 BAUD_RATE = 115200
 
 # Banner-only discovery (SPP v2): how long to wait for the two-line banner.
 BANNER_TIMEOUT_S = 2.0
+
+# Automatic retry: pause between discovery passes while the device is
+# off/unreachable. Discovery writes nothing, so a retry loop can never
+# burn an authentication attempt.
+RETRY_INTERVAL_MS = 2000
 
 # Timing & Protocol
 PACKET_SIZE         = 36
@@ -1103,7 +1109,7 @@ def _load_spp_generation(settings):
     return _SPP_DEFAULT_GENERATION
 
 
-def _load_spp_config():
+def _load_spp_config(fallback_identity=None):
     """Resolve the SPP v2 credentials and the generation seed for this connection.
 
     Returns ``(key, identity, generation)`` — ``(bytes, bytes, int)`` — or
@@ -1115,6 +1121,11 @@ def _load_spp_config():
     ``generation`` is the seed to authenticate WITH for this connection; it is
     only ever persisted afterwards by :func:`advance_generation`, and only after
     the handshake succeeded.
+
+    ``fallback_identity`` is a 6-byte Bluetooth address derived from the
+    paired device's COM-port metadata (auto-derivation). It is used only
+    when no identity is configured; an explicitly configured identity
+    always wins, and with neither the loader still fails closed.
     """
     settings = load_settings()
 
@@ -1124,7 +1135,20 @@ def _load_spp_config():
                        _SPP_KEY_ENV, _SPP_SETTINGS_KEY)
         return None
 
+    identity_explicit = (
+        _SPP_IDENTITY_ENV in os.environ
+        or _spp_setting(settings, _SPP_SETTINGS_IDENTITY) is not None
+    )
     identity = _load_spp_identity(settings)
+    if identity is None and identity_explicit:
+        logger.error("[SPP] configured device identity is invalid")
+        return None
+    if (identity is None
+            and isinstance(fallback_identity, (bytes, bytearray))
+            and len(fallback_identity) == _SPP_IDENTITY_BYTES):
+        identity = bytes(fallback_identity)
+        logger.info("[SPP] identity auto-derived from device MAC %s",
+                    identity.hex())
     if identity is None:
         logger.warning("[SPP] no device identity configured — set %s or '%s'",
                        _SPP_IDENTITY_ENV, _SPP_SETTINGS_IDENTITY)
@@ -1184,12 +1208,11 @@ def advance_generation(generation):
 class ConnectionScreen(QDialog):
     """MantisX-style connection verification — auto-discovers STASYS device.
 
-    Always attempts hardware discovery first; falls back to simulation if
-    no device is found after scanning all COM ports. No manual COM port
-    selection is exposed to the user.
+    Always attempts hardware discovery first. Each attempt runs on a worker
+    thread; while no device answers the screen keeps retrying every
+    RETRY_INTERVAL_MS until the device appears or the user continues in
+    simulation. No manual COM port selection is exposed to the user.
     """
-
-    SCAN_TIMEOUT_SEC = 8.0
 
     def __init__(self):
         super().__init__()
@@ -1201,6 +1224,12 @@ class ConnectionScreen(QDialog):
         self.serial_port = None
         self.is_simulation = False
         self.parser = spp.PacketParser()
+
+        # Cancellation flag shared with the worker thread: set on Continue /
+        # dialog close so an in-flight attempt stops and cleans up its port.
+        self._cancel_event = threading.Event()
+        self._workers = []
+        self._attempts = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(40, 32, 40, 32)
@@ -1245,7 +1274,9 @@ class ConnectionScreen(QDialog):
         # Continue button (hidden while scanning)
         self.btn_continue = QPushButton("Continue in Simulation")
         self.btn_continue.setCursor(Qt.PointingHandCursor)
-        self.btn_continue.setVisible(False)
+        # Visible from the first attempt: with the automatic retry loop the
+        # user must be able to leave for simulation at any time.
+        self.btn_continue.setVisible(True)
         self.btn_continue.clicked.connect(self._on_continue)
         self.btn_continue.setStyleSheet(f"""
             QPushButton {{
@@ -1261,14 +1292,19 @@ class ConnectionScreen(QDialog):
         """)
         layout.addWidget(self.btn_continue, alignment=Qt.AlignCenter)
 
+        # Single-shot scheduler for the automatic rescan loop.
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._launch_attempt)
+
         # Animate dots while scanning
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick_animation)
         self._anim_idx = 0
         self._anim_timer.start(180)
 
-        # Kick off scan asynchronously
-        QTimer.singleShot(150, self._start_scan)
+        # Kick off the first attempt asynchronously
+        QTimer.singleShot(150, self._launch_attempt)
 
     def _tick_animation(self):
         if self.serial_port is not None or self.is_simulation:
@@ -1276,48 +1312,63 @@ class ConnectionScreen(QDialog):
         self._anim_idx = (self._anim_idx + 1) % 4
         self.status_label.setText(f"Scanning for STASYS device{'.' * self._anim_idx}")
 
-    def _start_scan(self):
+    def _launch_attempt(self):
+        """Start one worker-thread connect attempt (no widget access there)."""
+        if self._cancel_event.is_set() or self.serial_port is not None:
+            return
+        worker = _ConnectionWorker(self.parser, self._cancel_event)
+        worker.attempt_done.connect(self._on_attempt_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda w=worker: self._drop_worker(w))
+        self._workers.append(worker)
+        worker.start()
+
+    def _drop_worker(self, worker):
         try:
-            discovered = discover_stasys_devices()
-        except Exception as exc:
-            logger.exception("Discovery failed: %s", exc)
-            discovered = []
+            self._workers.remove(worker)
+        except ValueError:
+            pass
 
-        if not discovered:
-            self._show_fallback()
+    def _on_attempt_done(self, result):
+        """GUI-thread outcome handling for one attempt."""
+        status, payload = result
+        if self._cancel_event.is_set():
+            # Race guard: Continue/close happened after the worker emitted
+            # but before this slot ran. The worker's cancel check and
+            # emit() are not one atomic step, so a connected port can still
+            # arrive here — close it or the handle leaks for the session.
+            if status == 'connected':
+                _close_quietly(payload[0])
             return
-
-        ser, desc, banner = discovered[0]
-        cfg = _load_spp_config()
-        if cfg is None:
-            try:
-                ser.close()
-            except Exception:
-                logger.exception("Failed to close unconfigured device port")
-            self._show_auth_failure(
-                "Set STASYS_DEVICE_KEY (or spp_key_hex in settings.json) and "
-                "STASYS_DEVICE_IDENTITY. Continuing in simulation."
-            )
-            return
-
-        ok, detail = perform_auth_v2(
-            ser, banner=banner, key=cfg[0], identity=cfg[1],
-            generation=cfg[2], pending_parser=self.parser,
-        )
-        if ok:
-            advance_generation(cfg[2])
+        if status == 'connected':
+            ser, description = payload
             self.serial_port = ser
-            self._show_success(ser.port, desc or ser.port)
-            return
+            self._show_success(ser.port, description)
+        elif status in ('config', 'auth_failed', 'error'):
+            # Terminal: retrying discovery would only repeat the same
+            # configuration/authentication/internal failure.
+            self._show_auth_failure(payload)
+        else:
+            # No device yet: keep looking. Discovery writes nothing, so
+            # retrying can never consume an authentication attempt.
+            self._attempts += 1
+            self.detail_label.setText(
+                "No device yet — keeping looking (attempt %d)…  "
+                "Power on the sensor, or continue in simulation."
+                % self._attempts)
+            self._schedule_retry()
 
-        try:
-            ser.close()
-        except Exception:
-            logger.exception("Failed to close port after authentication failure")
-        self._show_auth_failure(detail)
+    def _schedule_retry(self):
+        if self._cancel_event.is_set():
+            return
+        self._retry_timer.start(RETRY_INTERVAL_MS)
+
+    def _stop_connection_timers(self):
+        self._retry_timer.stop()
+        self._anim_timer.stop()
 
     def _show_success(self, port: str, description: str):
-        self._anim_timer.stop()
+        self._stop_connection_timers()
         self.status_icon.setText("✓")
         self.status_icon.setStyleSheet(f"color: {COLORS['accent_good']};")
         self.status_label.setText("STASYS device connected")
@@ -1326,23 +1377,8 @@ class ConnectionScreen(QDialog):
         # Auto-accept after short delay; button stays hidden on success
         QTimer.singleShot(1200, self.accept)
 
-    def _show_fallback(self):
-        self._anim_timer.stop()
-        self.serial_port = MockSerial()
-        self.is_simulation = True
-        self.status_icon.setText("!")
-        self.status_icon.setStyleSheet(f"color: {COLORS['accent_ok']};")
-        self.status_label.setText("No STASYS device found")
-        self.status_label.setStyleSheet(f"color: {COLORS['accent_ok']};")
-        self.detail_label.setText(
-            "Continuing in simulation mode. Connect a STASYS sensor "
-            "and restart to enable hardware."
-        )
-        self.btn_continue.setVisible(True)
-        self.btn_continue.setText("Continue in Simulation")
-
     def _show_auth_failure(self, detail: str):
-        self._anim_timer.stop()
+        self._stop_connection_timers()
         self.serial_port = MockSerial()
         self.is_simulation = True
         self.status_icon.setText("!")
@@ -1354,7 +1390,20 @@ class ConnectionScreen(QDialog):
         self.btn_continue.setText("Continue in Simulation")
 
     def _on_continue(self):
+        """Leave for simulation now; cancel any in-flight/retry attempt."""
+        self._cancel_event.set()
+        self._retry_timer.stop()
+        self._anim_timer.stop()
+        self.serial_port = MockSerial()
+        self.is_simulation = True
         self.accept()
+
+    def reject(self):
+        """Closing the dialog also cancels the attempt loop."""
+        self._cancel_event.set()
+        self._retry_timer.stop()
+        self._anim_timer.stop()
+        super().reject()
 
 def _default_packet_parser():
     """Lazily created module-level PacketParser, for single-arg callers."""
@@ -1501,17 +1550,80 @@ def perform_auth_v2(ser, *, banner=None, key, identity, generation,
 
 # ================= DEVICE DISCOVERY =================
 
+#: Windows embeds the peer Bluetooth address in a BTHENUM hardware id as
+#: 12 hex digits after an '&'; the digit run must not continue into a
+#: 13th hex digit. Trailing suffix text of any other kind is tolerated.
+#: The generic/placeholder endpoint of a pairing carries an all-zero value.
+_MAC_IN_HWID_RE = re.compile(r'&([0-9A-Fa-f]{12})(?![0-9A-Fa-f])')
+
+
+def _extract_port_mac(hwid):
+    """6-byte address from a Windows BTHENUM hardware id, or None.
+
+    Returns ``None`` for a missing/malformed id and for the all-zero
+    placeholder (which identifies no device).
+    """
+    match = _MAC_IN_HWID_RE.search(hwid or '')
+    if not match:
+        return None
+    digits = match.group(1)
+    if digits == '0' * 12:
+        return None
+    try:
+        return bytes.fromhex(digits)
+    except ValueError:
+        return None
+
+
+def _is_bluetooth_port(info):
+    """True for an RFCOMM/SPP virtual COM port, False for USB/other serials.
+
+    USB/flash serials (CH340 programming ports, etc.) must never be opened
+    during discovery. Ports carrying no hardware metadata at all (test
+    fakes, exotic backends) are kept: identification of the STASYS device
+    is still the strict v2 banner check — metadata only narrows and
+    prioritizes the candidate list.
+    """
+    hwid = (getattr(info, 'hwid', '') or '').lower()
+    description = (getattr(info, 'description', '') or '').lower()
+    if 'bthenum' in hwid or 'bluetooth' in hwid or 'bluetooth' in description:
+        return True
+    return not hwid.strip() and not description.strip()
+
+
 def discover_stasys_devices() -> list[tuple[serial.Serial, str, bytes]]:
     """Discover a device from its SPP v2 banner without probing it.
+
+    Candidates come from Windows port metadata: only Bluetooth RFCOMM/SPP
+    endpoints are considered, and endpoints carrying a device MAC are tried
+    before the generic pairing endpoint (lowest sorted port wins within
+    each group). Metadata only prioritizes — identification is the banner.
 
     Every candidate is opened read-only for discovery. The first two complete
     lines must be ``READY v=2`` and ``AUTH `` followed by 64 lowercase hex
     characters. The winning port remains open and its exact raw banner is
-    returned for :func:`perform_auth_v2` to prefill its receiver.
+    returned for :func:`perform_auth_v2` to prefill its receiver. When the
+    winning port's metadata carried a MAC it is attached to the open port
+    as ``spp_identity`` (6 bytes) for :func:`attempt_stasys_connection` to
+    use as the authentication identity when none is configured.
     """
     found: list[tuple[serial.Serial, str, bytes]] = []
-    candidates = [p.device for p in serial.tools.list_ports.comports()]
-    for port in sorted(candidates):
+    candidates = []
+    for info in serial.tools.list_ports.comports():
+        if not getattr(info, 'device', None):
+            logger.debug("[DISCOVERY] skipping port entry without device: %r", info)
+            continue
+        if not _is_bluetooth_port(info):
+            logger.debug("[DISCOVERY] skipping non-Bluetooth port %s (%s)",
+                         getattr(info, 'device', '?'),
+                         getattr(info, 'hwid', '')
+                         or getattr(info, 'description', ''))
+            continue
+        mac = _extract_port_mac(getattr(info, 'hwid', '') or '')
+        candidates.append((0 if mac else 1, info.device, mac))
+    candidates = sorted(set(candidates), key=lambda item: (item[0], item[1]))
+
+    for _priority, port, mac in candidates:
         probe_ser = None
         try:
             probe_ser = serial.Serial(port, BAUD_RATE, timeout=0.5)
@@ -1532,6 +1644,7 @@ def discover_stasys_devices() -> list[tuple[serial.Serial, str, bytes]]:
                 and lines[1].startswith(b"AUTH ")
                 and all(c in b"0123456789abcdef" for c in lines[1][5:])
             ):
+                probe_ser.spp_identity = mac
                 desc = getattr(probe_ser, "description", "") or port
                 found.append((probe_ser, desc, banner))
                 logger.info("Found STASYS v2 device on %s (%s)", port, desc)
@@ -1546,6 +1659,125 @@ def discover_stasys_devices() -> list[tuple[serial.Serial, str, bytes]]:
             ]:
                 probe_ser.close()
     return found
+
+
+def _close_quietly(port):
+    """Close a serial handle, swallowing and logging any close error."""
+    if port is None:
+        return
+    try:
+        if getattr(port, 'is_open', True):
+            port.close()
+    except Exception:
+        logger.exception("Failed to close serial port %s",
+                         getattr(port, 'port', '?'))
+
+
+def attempt_stasys_connection(parser):
+    """Run one full connect attempt: discover -> configure -> authenticate.
+
+    Pure decision logic with no widget access, so it can run on a worker
+    thread (see :class:`_ConnectionWorker`). Returns ``(status, payload)``:
+
+    * ``('none', None)``            -- no v2 banner; the caller may retry.
+    * ``('config', detail)``        -- banner found but credentials missing;
+      the port is closed and no handshake was attempted.
+    * ``('auth_failed', detail)``   -- the handshake ran and failed; port closed.
+    * ``('error', detail)``         -- enumeration or unexpected internal
+      failure; any discovered port is closed and the caller must NOT retry —
+      an internal fault must neither spin the retry loop nor masquerade as
+      absent hardware.
+    * ``('connected', (ser, desc))``-- authenticated; the port stays OPEN and
+      the generation seed has already been advanced.
+
+    Every path that does not return ``connected`` closes the discovered
+    port, exceptions included: a leaked handle would pin the COM port and
+    make every later attempt look like dead hardware.
+    """
+    try:
+        discovered = discover_stasys_devices()
+    except Exception as exc:
+        # Enumeration itself failed (radio/driver/API error). Treat this as
+        # terminal: retrying a broken enumerator forever would mask an
+        # application/platform fault as absent hardware.
+        logger.exception("Device enumeration failed: %s", exc)
+        return 'error', (
+            "Bluetooth port enumeration failed (%s). Check the Bluetooth "
+            "adapter/driver, then restart the app." % exc
+        )
+
+    ser = None
+    try:
+        if not discovered:
+            return 'none', None
+
+        ser, desc, banner = discovered[0]
+        mac = getattr(ser, 'spp_identity', None)
+        cfg = _load_spp_config(fallback_identity=mac)
+        if cfg is None:
+            _close_quietly(ser)
+            ser = None
+            return 'config', (
+                "Set STASYS_DEVICE_KEY (or spp_key_hex in settings.json) and "
+                "STASYS_DEVICE_IDENTITY. Continuing in simulation."
+            )
+
+        ok, detail = perform_auth_v2(
+            ser, banner=banner, key=cfg[0], identity=cfg[1],
+            generation=cfg[2], pending_parser=parser,
+        )
+        if ok:
+            advance_generation(cfg[2])
+            return 'connected', (ser, desc or ser.port)
+
+        _close_quietly(ser)
+        ser = None
+        return 'auth_failed', detail
+    except Exception as exc:
+        logger.exception("Connection attempt failed internally: %s", exc)
+        _close_quietly(ser)
+        return 'error', (
+            "Internal connection error (%s). This is an application bug, "
+            "not missing hardware — continuing in simulation." % exc
+        )
+
+
+class _ConnectionWorker(QThread):
+    """Runs one attempt_stasys_connection() pass off the GUI thread.
+
+    A full pass (open + 2 s banner wait per Bluetooth port) would freeze the
+    connection dialog, so it runs here and reports back through
+    ``attempt_done``. When the attempt was cancelled meanwhile nothing is
+    emitted and a port that would have connected is closed instead, so a
+    stale worker can never hand a live handle to the simulation path.
+    """
+    attempt_done = pyqtSignal(object)
+
+    def __init__(self, parser, cancel_event):
+        super().__init__()
+        self._parser = parser
+        self._cancel_event = cancel_event
+
+    def run(self):
+        try:
+            result = attempt_stasys_connection(self._parser)
+        except Exception as exc:
+            # attempt_stasys_connection handles its own exceptions; anything
+            # escaping is a bug. Report it as TERMINAL so it cannot spin the
+            # retry loop or masquerade as absent hardware.
+            logger.exception("Connection attempt crashed: %s", exc)
+            result = 'error', (
+                "Internal connection error (%s). This is an application "
+                "bug, not missing hardware — continuing in simulation." % exc
+            )
+        if self._cancel_event.is_set():
+            if result[0] == 'connected':
+                try:
+                    result[1][0].close()
+                except Exception:
+                    logger.exception("Failed to close cancelled connection port")
+            return
+        self.attempt_done.emit(result)
 
 
 # ================= CORE LOGIC =================
@@ -3306,15 +3538,29 @@ class MainWindow(QMainWindow):
         self._build_live_monitor_tab()
         self._build_settings_tab()
 
-        # ---- SCATT layout opt-in (env STASYS_LAYOUT=scatt) ----------------
+        # ---- SCATT layout (DEFAULT; set STASYS_LAYOUT=legacy to opt out) --
         # Reproduces SCATT Basic's chrome AROUND the existing tab content:
         # TitleBar (mode/session/status) above, StatusBar footer below, tabs
         # kept as the mode switch for this pass (docs/scatt_ui_spec.md 8.4-A).
-        # Additive only: with the env var unset the legacy layout above is
-        # untouched. Layout provenance is static SCATT extraction only.
-        if os.environ.get('STASYS_LAYOUT', '').strip().lower() == 'scatt':
+        # Default-on: any value except the exact token 'legacy' installs the
+        # chrome (unset, empty, 'scatt', or anything unrecognized).
+        # Layout provenance is static SCATT extraction only.
+        if os.environ.get('STASYS_LAYOUT', '').strip().lower() != 'legacy':
             try:
-                from .scatt_layout import StatusBar, TitleBar
+                if __package__:
+                    from .scatt_layout import StatusBar, TitleBar
+                else:
+                    # Direct launcher mode has no package context. Add the
+                    # python_app directory so the same package is importable.
+                    _python_app_dir = os.path.dirname(_core_dir)
+                    if _python_app_dir not in sys.path:
+                        sys.path.insert(0, _python_app_dir)
+                    # Register this running module as stasys_app.core so the
+                    # layout's palette reuses it instead of re-executing
+                    # core.py as a duplicate second module object.
+                    sys.modules.setdefault(
+                        'stasys_app.core', sys.modules[__name__])
+                    from stasys_app.scatt_layout import StatusBar, TitleBar
 
                 shell = QWidget()
                 shell_l = QVBoxLayout(shell)
@@ -3335,14 +3581,24 @@ class MainWindow(QMainWindow):
                             return
                 self.scatt_title_bar.settingsRequested.connect(_goto_settings)
 
-                # The legacy header frame is superseded by the TitleBar.
+                # The legacy header frame is superseded by the TitleBar --
+                # but it holds the ONLY SIMULATION MODE indicator, so mirror
+                # that state onto the TitleBar status badge before hiding it
+                # (same hasattr condition the legacy badge uses).
+                if hasattr(self.ser, 'update_sim'):
+                    # Same pairing the legacy badge used: accent_ok amber
+                    # background with bg_primary dark text -- legible, and
+                    # not a shot-cycle status_* role.
+                    self.scatt_title_bar.set_status(
+                        'SIMULATION', role='accent_ok', fg='bg_primary')
                 first = self.centralWidget().layout().itemAt(0).widget()
                 if first is not None:
                     first.setVisible(False)
                 self.setCentralWidget(shell)
             except Exception:
                 logger.exception(
-                    'SCATT layout unavailable; keeping legacy layout')
+                    'SCATT chrome failed to install; falling back to the '
+                    'already-built layout')
 
     def _build_shot_detection_tab(self):
         """Build the analysis-first landing tab."""
@@ -4765,6 +5021,8 @@ class MainWindow(QMainWindow):
 # ================= ENTRY POINT =================
 
 if __name__ == '__main__':
+    # Canonical direct launcher:  python python_app/stasys_app/core.py
+    # (SL.py stays a backward-compatible facade running the same sequence.)
     setup_database()
     app = QApplication(sys.argv)
 
@@ -4772,11 +5030,10 @@ if __name__ == '__main__':
     if conn.exec_() != QDialog.Accepted:
         sys.exit(0)
 
-    ser = conn.serial_port
-    sim_mode = conn.is_simulation
-
-    win = MainWindow(ser)
-    if sim_mode:
+    # Reuse the parser that completed the SPP v2 handshake inside
+    # ConnectionScreen instead of letting MainWindow build a fresh one.
+    win = MainWindow(conn.serial_port, conn.parser)
+    if conn.is_simulation:
         win.setWindowTitle(win.windowTitle() + " [SIMULATION]")
     win.show()
     sys.exit(app.exec_())
